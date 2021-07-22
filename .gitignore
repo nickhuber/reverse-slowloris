@@ -1,2 +1,3 @@
 *.exe
 reverse-slowloris
+db.sqlite3

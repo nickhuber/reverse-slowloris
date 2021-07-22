@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/alecthomas/kong"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 const headers = `HTTP/1.x 200 OK
@@ -21,8 +23,6 @@ Content-Type: text/plain; charset=iso-8859-1
 X-Content-Type-Options: nosniff
 
 `
-
-const port = ":6969"
 
 var cli struct {
 	Payload string `arg name:"payload" help:"content to send as a response." type:"string"`
@@ -34,7 +34,14 @@ func main() {
 		kong.Name("reverse-slowloris"),
 		kong.Description("A server that sends a slow HTTP response forever to whoever connects to it."))
 
-	var requestNum = 0
+	db, err := sql.Open("sqlite3", "db.sqlite3")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+	createTable(db)
+
+	var requestNum = getStartingID(db)
 
 	payload, err := ioutil.ReadFile(cli.Payload)
 	if err != nil {
@@ -56,7 +63,7 @@ func main() {
 			log.Fatalf("Error accepting: ", err.Error())
 		}
 		// Handle connections in a new goroutine.
-		go handleRequest(conn, requestNum, payload)
+		go handleRequest(conn, db, requestNum, payload)
 		requestNum++
 	}
 }
@@ -85,7 +92,7 @@ func getParsedRequest(conn net.Conn) (*http.Request, error) {
 	return readRequest, nil
 }
 
-func handleRequest(conn net.Conn, requestNum int, payload []byte) {
+func handleRequest(conn net.Conn, db *sql.DB, requestNum int, payload []byte) {
 	defer conn.Close()
 	started := time.Now()
 	parsedRequest, err := getParsedRequest(conn)
@@ -96,11 +103,13 @@ func handleRequest(conn net.Conn, requestNum int, payload []byte) {
 	requester := getProbableRemoteIP(parsedRequest, conn)
 	conn.Write([]byte(headers))
 
+	path := parsedRequest.URL.RequestURI()
+
 	log.Printf(
 		"%d | %s connected asking for %s, starting to stream response\n",
 		requestNum,
 		requester,
-		parsedRequest.URL.RequestURI(),
+		path,
 	)
 	keepGoing := true
 	for {
@@ -114,13 +123,63 @@ func handleRequest(conn net.Conn, requestNum int, payload []byte) {
 				keepGoing = false
 				break
 			}
+			upsertConnectionRow(db, requestNum, requester, path, int64(time.Since(started)/time.Millisecond), started.Unix(), true)
 			time.Sleep(75 * time.Millisecond)
 		}
 		if keepGoing {
-			elapsed := time.Since(started).Round(time.Second)
-			log.Printf("%d | %s Has been streaming for %s\n", requestNum, requester, elapsed)
+			log.Printf("%d | %s Has been streaming for %s\n", requestNum, requester, time.Since(started))
 		}
 	}
-	elapsed := time.Since(started).Round(time.Second)
+	elapsed := time.Since(started)
+	upsertConnectionRow(db, requestNum, requester, path, int64(elapsed/time.Millisecond), started.Unix(), false)
 	log.Printf("%d | %s closed their connection after %s\n", requestNum, requester, elapsed)
+}
+
+func createTable(db *sql.DB) {
+	createStudentTableSQL := `CREATE TABLE IF NOT EXISTS connections (
+		"id" integer NOT NULL PRIMARY KEY AUTOINCREMENT,		
+		"source_ip" TEXT,
+		"path" TEXT,
+		"duration" INTEGER,
+		"started_at" INTEGER,
+		"in_progress" INTEGER
+	  );`
+
+	log.Println("Creating table for connections")
+	statement, err := db.Prepare(createStudentTableSQL)
+	if err != nil {
+		log.Fatalln("Invalid statment or something: " + err.Error())
+	}
+	statement.Exec()
+}
+
+func upsertConnectionRow(db *sql.DB, id int, source_ip string, path string, duration int64, started_at int64, in_progress bool) {
+	insertSQL := `INSERT INTO connections(id, source_ip, path, duration, started_at, in_progress)
+				VALUES (?, ?, ?, ?, ?, ?)
+				ON CONFLICT(id) DO UPDATE SET
+					source_ip=excluded.source_ip,
+					path=excluded.path,
+					duration=excluded.duration,
+					started_at=excluded.started_at,
+					in_progress=excluded.in_progress`
+	statement, err := db.Prepare(insertSQL)
+	if err != nil {
+		log.Fatalln(err.Error())
+	}
+	_, err = statement.Exec(id, source_ip, path, duration, started_at, in_progress)
+	if err != nil {
+		log.Fatalln(err.Error())
+	}
+}
+
+func getStartingID(db *sql.DB) int {
+	sql := `SELECT MAX(id) AS id FROM connections`
+	var id int
+	row := db.QueryRow(sql)
+	switch err := row.Scan(&id); err {
+	case nil:
+		return id + 1
+	default:
+		return 0
+	}
 }
