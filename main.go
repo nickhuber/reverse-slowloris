@@ -41,6 +41,8 @@ func main() {
 	defer db.Close()
 	createTable(db)
 
+	unsetInProgress(db)
+
 	var requestNum = getStartingID(db)
 
 	payload, err := ioutil.ReadFile(cli.Payload)
@@ -150,6 +152,7 @@ func createTable(db *sql.DB) {
 	if err != nil {
 		log.Fatalln("Invalid statment or something: " + err.Error())
 	}
+	defer statement.Close()
 	statement.Exec()
 }
 
@@ -166,6 +169,7 @@ func upsertConnectionRow(db *sql.DB, id int, source_ip string, path string, dura
 	if err != nil {
 		log.Fatalln(err.Error())
 	}
+	defer statement.Close()
 	_, err = statement.Exec(id, source_ip, path, duration, started_at, in_progress)
 	if err != nil {
 		log.Fatalln(err.Error())
@@ -181,5 +185,13 @@ func getStartingID(db *sql.DB) int {
 		return id + 1
 	default:
 		return 0
+	}
+}
+
+func unsetInProgress(db *sql.DB) {
+	sql := `UPDATE connections SET in_progress = 0 WHERE in_progress = 1`
+	_, err := db.Exec(sql)
+	if err != nil {
+		log.Fatalln(err.Error())
 	}
 }
